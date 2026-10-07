@@ -10,9 +10,11 @@ T3 Code v0.0.44), so a T3 update can break it.
 
 ## Why I built this
 
-I run most of my coding agents inside T3 Code, and I wanted one agent to be
-able to start others: "spin up a thread in that repo and fix X", or fan a
-task out across a few projects, then read back what each one did.
+I run most of my coding agents inside T3 Code. My main use is a monitoring
+thread: it watches production logs and GitHub issues, and for each problem it
+finds it starts a new T3 thread that fixes it and opens a PR. Because those
+are real T3 threads, I can follow every fix in the T3 sidebar, open any of
+them to see what the agent is doing, and see its PR's state next to it.
 
 T3 doesn't offer that to agents. The `t3-code` MCP server that T3 gives its
 sessions only covers the current thread's browser, devices and pull requests.
@@ -78,13 +80,14 @@ Install t3code-cli from https://github.com/oxalorg/t3code-cli for me.
 ```sh
 t3code-cli projects                          # id, title, workspace root
 t3code-cli project add <path> [--title T]    # register a folder as a T3 project
-t3code-cli threads [--project P] [--all]     # unsettled threads; --all adds settled
-t3code-cli new [--project P] [--title T] [--model M] [--provider ID] \
+t3code-cli threads [--project P] [--all]     # id, project, state, updated, PRs, title
+t3code-cli new [--project P] [--key KEY] [--title T] [--model M] [--provider ID] \
                [--runtime MODE] [--plan] [--worktree [--base B] [--branch NAME]] \
                "<prompt>"                    # prints the new thread id
 t3code-cli send <id> [--plan] "<prompt>"     # follow-up turn
 t3code-cli wait <id> [--timeout SECONDS]     # block until the turn ends
-t3code-cli status <id>                       # JSON summary
+t3code-cli status <id>                       # JSON summary, including linked PRs
+t3code-cli find <key>                        # threads started with --key KEY
 t3code-cli read <id> [--all]                 # latest reply, or the whole transcript
 t3code-cli archive <id>
 ```
@@ -102,6 +105,32 @@ t3code-cli read "$id"
 
 With the skill installed, you can just ask Claude Code: "start a T3 thread in
 myapp that fixes the flaky login test, and tell me what it did".
+
+### A monitoring thread that spawns fix threads
+
+Give each problem a key (an issue reference works well) and start its fix
+thread in its own worktree:
+
+```sh
+t3code-cli new --project myapp --key "owner/repo#42" --worktree - <<'EOF'
+Fix https://github.com/owner/repo/issues/42: checkout fails for empty carts.
+Add a test that fails before the fix, make it pass, run the checks, then
+push and open a PR that says "Fixes #42".
+EOF
+```
+
+- `--key` makes this safe to repeat. If the project already has a thread for
+  `owner/repo#42`, `new` prints that thread's id instead of starting another,
+  so a monitor that sees the same error twice doesn't open two fixes.
+- `--worktree` gives each fix its own checkout and branch, so several fixes
+  can run at once without touching each other or your main checkout.
+- T3 sessions link the PRs they open to their thread. The PR shows up next to
+  the thread in T3, and `t3code-cli threads` shows it too (`#57 open`).
+
+With the skill installed, you can tell your monitoring thread something like:
+"Whenever you find a new production error, file an issue for it and start a
+t3code-cli fix thread for it with --key and --worktree; run at most 3 at
+once."
 
 See [`skills/t3code-cli/SKILL.md`](skills/t3code-cli/SKILL.md) for every
 option and its defaults.

@@ -13,18 +13,21 @@ const USAGE = `usage:
   t3code-cli projects
   t3code-cli project add <path> [--title T]
   t3code-cli threads [--project P] [--all]
-  t3code-cli new [--project P] [--title T] [--model M] [--provider ID]
+  t3code-cli new [--project P] [--key KEY] [--title T] [--model M] [--provider ID]
                 [--runtime MODE] [--plan] [--worktree [--base B] [--branch NAME]]
                 <prompt | ->
   t3code-cli send <thread-id> [--plan] [--runtime MODE] <prompt | ->
   t3code-cli status <thread-id>
+  t3code-cli find <key>
   t3code-cli wait <thread-id> [--timeout SECONDS]
   t3code-cli read <thread-id> [--all]      (latest reply or plan; --all: transcript)
   t3code-cli archive <thread-id>
 
 P is a project id, title, or workspace path (default: current directory).
 MODE: full-access (default) | auto-accept-edits | auto | approval-required.
-A prompt of "-" is read from stdin.`;
+A prompt of "-" is read from stdin.
+--key KEY: if a thread with this key exists in the project, print its id
+instead of creating one (for monitors that spawn one thread per issue).`;
 
 const DEFAULT_MODEL = { instanceId: "claudeAgent", model: "claude-opus-5-5", options: [] };
 
@@ -204,6 +207,29 @@ function threadState(thread) {
   return "idle";
 }
 
+// id, project, state, updated, PRs ("#4 merged", "-" if none), title
+function threadLine(thread, projectTitles) {
+  const prs = prSummary(thread).map((pr) => `#${pr.url.split("/").pop()} ${pr.state}`).join(",") || "-";
+  return [thread.id, projectTitles[thread.projectId] ?? "?", threadState(thread), thread.updatedAt.slice(0, 16), prs, thread.title].join("\t");
+}
+
+function prSummary(thread) {
+  return (thread.pullRequests ?? []).map((pr) => ({ url: pr.url, state: pr.snapshot?.state ?? "unknown", title: pr.snapshot?.title ?? null }));
+}
+
+// --key KEY embeds this marker in the first message. T3 regenerates thread
+// titles, so the marker (found through T3's message search) is what ties a
+// thread to its key.
+const keyMarker = (key) => `[t3code-cli key: ${key}]`;
+
+async function threadsForKey(snap, key) {
+  const marker = keyMarker(key);
+  if (marker.length > 200) die("--key is too long (max ~180 characters)");
+  const { matches } = await rpc("orchestration.searchThreads", { query: marker, limit: 50 });
+  const ids = new Set(matches.filter((m) => m.source === "user" && m.snippet.includes(marker)).map((m) => m.threadId));
+  return snap.threads.filter((t) => ids.has(t.id) && !t.deletedAt);
+}
+
 function findThread(snap, id) {
   const thread = snap.threads.find((t) => t.id === id && !t.deletedAt);
   if (!thread) die(`no thread ${id}`);
@@ -254,14 +280,23 @@ async function cmdThreads(flags) {
     .filter((t) => !t.deletedAt && !t.archivedAt && (!project || t.projectId === project.id))
     .filter((t) => flags.all || !t.settledAt)
     .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1))
-    .forEach((t) => console.log(`${t.id}\t${titles[t.projectId] ?? "?"}\t${threadState(t)}\t${t.updatedAt.slice(0, 16)}\t${t.title}`));
+    .forEach((t) => console.log(threadLine(t, titles)));
 }
 
 async function cmdNew(flags, positional) {
-  const prompt = readPrompt(positional);
+  let prompt = readPrompt(positional);
   if (!prompt) die("a prompt is required");
   const snap = await snapshot();
   const project = findProject(snap, flags.project);
+  if (flags.key) {
+    const existing = (await threadsForKey(snap, flags.key)).filter((t) => t.projectId === project.id);
+    if (existing.length > 0) {
+      console.log(existing[0].id);
+      console.error(`thread for key "${flags.key}" already exists: ${existing[0].title} (${threadState(existing[0])})`);
+      return;
+    }
+    prompt = `${prompt}\n\n${keyMarker(flags.key)}`;
+  }
   const base = defaultModel(snap, project);
   const modelSelection = pickModel(snap, base, flags);
   const runtimeMode = checkRuntime(flags.runtime ?? "full-access");
@@ -339,7 +374,15 @@ async function cmdStatus(positional) {
     worktreePath: thread.worktreePath,
     latestTurn: thread.latestTurn,
     lastError: thread.session?.lastError ?? null,
+    pullRequests: prSummary(thread),
   }, null, 2));
+}
+
+async function cmdFind(positional) {
+  if (!positional[0]) die("find needs a key");
+  const snap = await snapshot();
+  const titles = Object.fromEntries(snap.projects.map((p) => [p.id, p.title]));
+  for (const t of await threadsForKey(snap, positional.join(" "))) console.log(threadLine(t, titles));
 }
 
 async function cmdWait(flags, positional) {
@@ -404,6 +447,7 @@ try {
   else if (command === "new") await cmdNew(flags, positional);
   else if (command === "send") await cmdSend(flags, positional);
   else if (command === "status") await cmdStatus(positional);
+  else if (command === "find") await cmdFind(positional);
   else if (command === "wait") await cmdWait(flags, positional);
   else if (command === "read") await cmdRead(flags, positional);
   else if (command === "archive") await cmdArchive(positional);
