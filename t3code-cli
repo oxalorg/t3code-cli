@@ -1,0 +1,413 @@
+#!/usr/bin/env node
+// t3code-cli: create T3 Code threads and start agent turns from the command line.
+// Talks to the local T3 server (~/.t3/userdata/server-runtime.json) with a
+// short-lived bearer token from `t3 auth session issue`, revoked on exit.
+
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
+
+const USAGE = `usage:
+  t3code-cli projects
+  t3code-cli project add <path> [--title T]
+  t3code-cli threads [--project P] [--all]
+  t3code-cli new [--project P] [--title T] [--model M] [--provider ID]
+                [--runtime MODE] [--plan] [--worktree [--base B] [--branch NAME]]
+                <prompt | ->
+  t3code-cli send <thread-id> [--plan] [--runtime MODE] <prompt | ->
+  t3code-cli status <thread-id>
+  t3code-cli wait <thread-id> [--timeout SECONDS]
+  t3code-cli read <thread-id> [--all]      (latest reply or plan; --all: transcript)
+  t3code-cli archive <thread-id>
+
+P is a project id, title, or workspace path (default: current directory).
+MODE: full-access (default) | auto-accept-edits | auto | approval-required.
+A prompt of "-" is read from stdin.`;
+
+const DEFAULT_MODEL = { instanceId: "claudeAgent", model: "claude-opus-5-5", options: [] };
+
+function die(message) {
+  console.error(`t3code-cli: ${message}`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  const booleans = new Set(["plan", "worktree", "all", "help"]);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-" || !arg.startsWith("-")) positional.push(arg);
+    else if (arg === "-h") flags.help = true;
+    else {
+      const name = arg.replace(/^--/, "");
+      if (booleans.has(name)) flags[name] = true;
+      else if (i + 1 < argv.length) flags[name] = argv[++i];
+      else die(`--${name} needs a value`);
+    }
+  }
+  return { flags, positional };
+}
+
+// --- server connection -------------------------------------------------------
+
+// server-runtime.json is not always present while the service runs, so fall
+// back to T3_PORT or the service's default port.
+const runtime = (() => {
+  if (process.env.T3_PORT) return { port: Number(process.env.T3_PORT) };
+  const file = join(process.env.T3CODE_HOME ?? join(homedir(), ".t3"), "userdata", "server-runtime.json");
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return { port: 3773 };
+  }
+})();
+const origin = `http://127.0.0.1:${runtime.port}`;
+
+let session = null;
+function token() {
+  if (!session) {
+    const out = execFileSync("t3", ["auth", "session", "issue", "--ttl", "10m", "--label", "t3code-cli", "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    session = JSON.parse(out);
+  }
+  return session.token;
+}
+function revoke() {
+  if (!session) return;
+  try {
+    execFileSync("t3", ["auth", "session", "revoke", session.sessionId], { stdio: "ignore" });
+  } catch {}
+  session = null;
+}
+// die() exits mid-command, so revoke on every exit, not just the happy path.
+process.on("exit", revoke);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => process.exit(130));
+
+async function snapshot() {
+  const res = await fetch(`${origin}/api/orchestration/snapshot`, { headers: { authorization: `Bearer ${token()}` } });
+  if (!res.ok) die(`snapshot failed: HTTP ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+// Effect RPC over the /ws socket. A unary call resolves with its Exit value; a
+// stream call (firstChunk) resolves with the first chunk and interrupts the rest.
+function rpc(tag, payload, { firstChunk = false } = {}) {
+  return new Promise((resolvePromise, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${runtime.port}/ws`, { headers: { authorization: `Bearer ${token()}` } });
+    const finish = (fn, value) => {
+      clearTimeout(timer);
+      ws.close();
+      fn(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error("timed out waiting for the server")), 120_000);
+    ws.onopen = () => ws.send(JSON.stringify({ _tag: "Request", id: "1", tag, payload, headers: [] }));
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(String(event.data));
+      if (msg._tag === "Ping") return ws.send(JSON.stringify({ _tag: "Pong" }));
+      if (msg._tag === "Defect") return finish(reject, new Error(JSON.stringify(msg.defect)));
+      if (msg.requestId !== "1") return;
+      if (msg._tag === "Chunk" && firstChunk) {
+        ws.send(JSON.stringify({ _tag: "Interrupt", requestId: "1" }));
+        return finish(resolvePromise, msg.values);
+      }
+      if (msg._tag !== "Exit") return;
+      if (msg.exit._tag === "Success") finish(resolvePromise, msg.exit.value);
+      else finish(reject, new Error(JSON.stringify(msg.exit.cause)));
+    };
+    ws.onerror = () => finish(reject, new Error("WebSocket connection failed (bad token or server down?)"));
+  });
+}
+
+const dispatch = (command) => rpc("orchestration.dispatchCommand", command);
+
+async function threadDetail(threadId) {
+  const values = await rpc("orchestration.subscribeThread", { threadId }, { firstChunk: true });
+  const item = values.find((v) => v.kind === "snapshot");
+  if (!item) throw new Error("server sent no thread snapshot");
+  return item.snapshot;
+}
+
+// --- helpers -----------------------------------------------------------------
+
+function liveProjects(snap) {
+  return snap.projects.filter((p) => !p.deletedAt);
+}
+
+function findProject(snap, ref) {
+  const projects = liveProjects(snap);
+  const byId = projects.find((p) => p.id === ref);
+  if (byId) return byId;
+  let path = null;
+  try {
+    path = realpathSync(resolve(ref ?? process.cwd()));
+  } catch {}
+  const matches = projects.filter((p) => (ref && p.title === ref) || (path && p.workspaceRoot === path));
+  if (matches.length === 0) die(`no T3 project matches "${ref ?? process.cwd()}" (see: t3code-cli projects; add one with: t3code-cli project add <path>)`);
+  // Duplicate projects for one folder happen; use the most recently active one.
+  return matches.sort((a, b) => (latestActivity(snap, b) > latestActivity(snap, a) ? 1 : -1))[0];
+}
+
+function latestActivity(snap, project) {
+  return snap.threads
+    .filter((t) => t.projectId === project.id)
+    .reduce((max, t) => (t.updatedAt > max ? t.updatedAt : max), project.updatedAt);
+}
+
+function defaultModel(snap, project) {
+  if (project.defaultModelSelection) return project.defaultModelSelection;
+  const recent = snap.threads
+    .filter((t) => t.projectId === project.id && t.modelSelection && !t.deletedAt)
+    .sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1))[0];
+  return recent?.modelSelection ?? DEFAULT_MODEL;
+}
+
+// --provider without --model uses the model last run on that provider.
+function pickModel(snap, base, flags) {
+  if (!flags.model && !flags.provider) return base;
+  const instanceId = flags.provider ?? base.instanceId;
+  if (flags.model) return { instanceId, model: flags.model, options: [] };
+  if (instanceId === base.instanceId) return base;
+  const recent = snap.threads
+    .filter((t) => t.modelSelection?.instanceId === instanceId)
+    .sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1))[0];
+  if (!recent) die(`no earlier thread uses provider "${instanceId}"; pass --model too`);
+  return recent.modelSelection;
+}
+
+function gitBranch(cwd) {
+  try {
+    return execFileSync("git", ["-C", cwd, "branch", "--show-current"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function readPrompt(positional) {
+  const text = positional.join(" ");
+  if (text === "-") return readFileSync(0, "utf8").trim();
+  return text.trim();
+}
+
+function threadState(thread) {
+  if (thread.session?.status === "running" || thread.latestTurn?.state === "running") return "running";
+  if (thread.session?.lastError) return "error";
+  // The turn outcome (completed | interrupted | error) wins over settled and
+  // archived, since threads auto-settle once a turn completes.
+  if (thread.latestTurn?.state) return thread.latestTurn.state;
+  if (thread.archivedAt) return "archived";
+  if (thread.settledAt) return "settled";
+  return "idle";
+}
+
+function findThread(snap, id) {
+  const thread = snap.threads.find((t) => t.id === id && !t.deletedAt);
+  if (!thread) die(`no thread ${id}`);
+  return thread;
+}
+
+function checkRuntime(mode) {
+  const modes = ["full-access", "auto-accept-edits", "auto", "approval-required"];
+  if (!modes.includes(mode)) die(`--runtime must be one of ${modes.join(", ")}`);
+  return mode;
+}
+
+// --- commands ----------------------------------------------------------------
+
+async function cmdProjects() {
+  const snap = await snapshot();
+  for (const p of liveProjects(snap)) console.log(`${p.id}\t${p.title}\t${p.workspaceRoot}`);
+}
+
+// Goes through the running server; `t3 project add` writes the database
+// behind its back, and the server then rejects threads for that project.
+async function cmdProjectAdd(flags, positional) {
+  if (!positional[0]) die("project add needs a path");
+  let root;
+  try {
+    root = realpathSync(resolve(positional[0]));
+  } catch {
+    die(`no such directory: ${positional[0]}`);
+  }
+  const existing = liveProjects(await snapshot()).find((p) => p.workspaceRoot === root);
+  if (existing) {
+    console.log(existing.id);
+    console.error(`already a project: ${existing.title}`);
+    return;
+  }
+  const projectId = randomUUID();
+  const title = flags.title ?? basename(root);
+  await dispatch({ type: "project.create", commandId: randomUUID(), projectId, title, workspaceRoot: root, createdAt: new Date().toISOString() });
+  console.log(projectId);
+  console.error(`added project ${title} (${root})`);
+}
+
+async function cmdThreads(flags) {
+  const snap = await snapshot();
+  const project = flags.project ? findProject(snap, flags.project) : null;
+  const titles = Object.fromEntries(snap.projects.map((p) => [p.id, p.title]));
+  snap.threads
+    .filter((t) => !t.deletedAt && !t.archivedAt && (!project || t.projectId === project.id))
+    .filter((t) => flags.all || !t.settledAt)
+    .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1))
+    .forEach((t) => console.log(`${t.id}\t${titles[t.projectId] ?? "?"}\t${threadState(t)}\t${t.updatedAt.slice(0, 16)}\t${t.title}`));
+}
+
+async function cmdNew(flags, positional) {
+  const prompt = readPrompt(positional);
+  if (!prompt) die("a prompt is required");
+  const snap = await snapshot();
+  const project = findProject(snap, flags.project);
+  const base = defaultModel(snap, project);
+  const modelSelection = pickModel(snap, base, flags);
+  const runtimeMode = checkRuntime(flags.runtime ?? "full-access");
+  const interactionMode = flags.plan ? "plan" : "default";
+  const title = (flags.title ?? prompt.split("\n")[0]).slice(0, 80).trim() || "New thread";
+  const branch = gitBranch(project.workspaceRoot);
+  const now = new Date().toISOString();
+  const threadId = randomUUID();
+
+  if (flags.worktree && !branch && !flags.base) die("--worktree needs a git project (or --base)");
+  const bootstrap = {
+    createThread: { projectId: project.id, title, modelSelection, runtimeMode, interactionMode, branch, worktreePath: null, createdAt: now },
+    ...(flags.worktree
+      ? {
+          prepareWorktree: {
+            projectCwd: project.workspaceRoot,
+            baseBranch: flags.base ?? branch,
+            requireWorktree: true,
+            // Same naming as the web app; without a new branch git refuses to
+            // check out the base branch a second time.
+            branch: flags.branch ?? `t3code/${randomUUID().replace(/-/g, "").slice(0, 8)}`,
+          },
+          runSetupScript: true,
+        }
+      : {}),
+  };
+
+  await dispatch({
+    type: "thread.turn.start",
+    commandId: randomUUID(),
+    threadId,
+    message: { messageId: randomUUID(), role: "user", text: prompt, attachments: [] },
+    modelSelection,
+    titleSeed: title,
+    runtimeMode,
+    interactionMode,
+    bootstrap,
+    createdAt: now,
+  });
+  console.log(threadId);
+  console.error(`started thread in ${project.title} (${modelSelection.instanceId}/${modelSelection.model}, ${runtimeMode}${flags.plan ? ", plan" : ""}${flags.worktree ? ", worktree" : ""})`);
+}
+
+async function cmdSend(flags, positional) {
+  const [threadId, ...rest] = positional;
+  if (!threadId) die("send needs a thread id");
+  const prompt = readPrompt(rest);
+  if (!prompt) die("a prompt is required");
+  const snap = await snapshot();
+  const thread = findThread(snap, threadId);
+  if (threadState(thread) === "running") die("thread is still running; wait for it first (t3code-cli wait)");
+  await dispatch({
+    type: "thread.turn.start",
+    commandId: randomUUID(),
+    threadId,
+    message: { messageId: randomUUID(), role: "user", text: prompt, attachments: [] },
+    runtimeMode: checkRuntime(flags.runtime ?? thread.runtimeMode),
+    interactionMode: flags.plan ? "plan" : thread.interactionMode,
+    createdAt: new Date().toISOString(),
+  });
+  console.error(`sent to ${thread.title}`);
+}
+
+async function cmdStatus(positional) {
+  const snap = await snapshot();
+  const thread = findThread(snap, positional[0]);
+  const project = snap.projects.find((p) => p.id === thread.projectId);
+  console.log(JSON.stringify({
+    id: thread.id,
+    title: thread.title,
+    project: project?.title,
+    state: threadState(thread),
+    model: thread.modelSelection?.model,
+    branch: thread.branch,
+    worktreePath: thread.worktreePath,
+    latestTurn: thread.latestTurn,
+    lastError: thread.session?.lastError ?? null,
+  }, null, 2));
+}
+
+async function cmdWait(flags, positional) {
+  const deadline = Date.now() + Number(flags.timeout ?? 1800) * 1000;
+  // Give a just-dispatched turn a moment to register as running.
+  await new Promise((r) => setTimeout(r, 3000));
+  for (;;) {
+    const thread = findThread(await snapshot(), positional[0]);
+    const state = threadState(thread);
+    if (state !== "running") {
+      console.log(state);
+      return;
+    }
+    if (Date.now() > deadline) die("timed out; thread still running");
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
+// Plan-mode turns on some providers end in a proposed plan rather than a
+// message, so both count as replies.
+async function cmdRead(flags, positional) {
+  if (!positional[0]) die("read needs a thread id");
+  const { messages = [], proposedPlans = [] } = (await threadDetail(positional[0])).thread;
+  const entries = [
+    ...messages.map((m) => ({ role: m.role, text: m.text, at: m.createdAt })),
+    ...proposedPlans.map((p) => ({ role: "plan", text: p.planMarkdown, at: p.createdAt })),
+  ].sort((x, y) => (x.at > y.at ? 1 : x.at < y.at ? -1 : 0));
+  if (flags.all) {
+    for (const e of entries) console.log(`--- ${e.role}\n${e.text}\n`);
+    return;
+  }
+  // Everything since the last user message: the proposed plan (if any) and
+  // the final reply, skipping system notices.
+  const start = entries.findLastIndex((e) => e.role === "user") + 1;
+  const reply = entries.slice(start).filter((e) => e.role === "plan" || e.role === "assistant");
+  if (reply.length === 0) die("no assistant reply yet");
+  const plan = reply.filter((e) => e.role === "plan").at(-1);
+  const last = reply.filter((e) => e.role === "assistant").at(-1);
+  console.log([plan?.text, last?.text].filter(Boolean).join("\n\n---\n\n"));
+}
+
+async function cmdArchive(positional) {
+  const snap = await snapshot();
+  const thread = findThread(snap, positional[0]);
+  await dispatch({ type: "thread.archive", commandId: randomUUID(), threadId: thread.id });
+  console.error(`archived ${thread.title}`);
+}
+
+// --- main --------------------------------------------------------------------
+
+const [command, ...rest] = process.argv.slice(2);
+const { flags, positional } = parseArgs(rest);
+if (!command || flags.help || ["help", "--help", "-h"].includes(command)) {
+  console.log(USAGE);
+  process.exit(0);
+}
+
+try {
+  if (command === "projects") await cmdProjects();
+  else if (command === "project" && positional[0] === "add") await cmdProjectAdd(flags, positional.slice(1));
+  else if (command === "threads") await cmdThreads(flags);
+  else if (command === "new") await cmdNew(flags, positional);
+  else if (command === "send") await cmdSend(flags, positional);
+  else if (command === "status") await cmdStatus(positional);
+  else if (command === "wait") await cmdWait(flags, positional);
+  else if (command === "read") await cmdRead(flags, positional);
+  else if (command === "archive") await cmdArchive(positional);
+  else die(`unknown command "${command}"\n${USAGE}`);
+} catch (error) {
+  die(error.message);
+}
